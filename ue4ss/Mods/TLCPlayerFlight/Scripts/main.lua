@@ -3,6 +3,8 @@ local ModMenu = require("ModMenu.ModMenu")
 local Config = ModMenu.ConfigManager
 
 local MOD_NAME = "TLCPlayerFlight"
+local MOD_VERSION = "0.2.1-beta.1"
+local TARGET_BUILD = "25982825"
 local MOVE_WALKING = 1
 local MOVE_FLYING = 5
 
@@ -434,4 +436,4 @@ RegisterConsoleCommandHandler("tlcdown", function(_, parameters, outputDevice)
 end)
 
 updateMenuStatus()
-log("Loaded - F7 opens settings; configured flight keys are active")
+log(string.format("Loaded v%s for game build %s - F7 opens settings; configured flight keys are active", MOD_VERSION, TARGET_BUILD))

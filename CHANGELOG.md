@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1-beta.1 - 2026-10-19
+
+- Maintenance package targeting Update 6, game 0.10.0.653173 / Steam build 25982825 / Unreal Engine 5.8.2.
+- Added the mod version and target build to the startup log for easier troubleshooting.
+- Retained the flight behavior, menu, controls, and existing configuration format.
+- Updated installation and compatibility records for the current game and UE4SS.
+
 ## 0.2.0-beta.1 - 2026-09-06
 
 - Added an in-game UMG settings panel on `F7`.

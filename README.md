@@ -6,12 +6,12 @@ The mod uses UE4SS to change the character movement mode directly because Unreal
 
 ## Compatibility
 
-- The Last Caretaker `0.8.5.651027 Hotfix 1`
-- Unreal Engine `5.8.1`
-- UE4SS experimental `v3.0.1-1125-g527a483b` or a newer UE 5.8-compatible build
+- The Last Caretaker `0.10.0.653173` (Update 6), Steam build `25982825`
+- Unreal Engine `5.8.2`
+- UE4SS experimental `v3.0.1-1181-g83330635` is the current compatibility-check runtime
 - DML and Dev Menu are optional and can be used alongside this mod
 
-The attached-flight functionality has been tested successfully. The v0.2 in-game settings panel is currently a beta feature.
+The maintainer confirmed loading an existing save, F6 flight, and the F7 menu on Update 6 with the updated UE4SS. Verification details are recorded in [VALIDATION.md](VALIDATION.md). This release remains a beta.
 
 ## Features
 
