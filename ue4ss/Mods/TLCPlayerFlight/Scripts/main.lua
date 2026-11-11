@@ -3,7 +3,7 @@ local ModMenu = require("ModMenu.ModMenu")
 local Config = ModMenu.ConfigManager
 
 local MOD_NAME = "TLCPlayerFlight"
-local MOD_VERSION = "0.2.1-beta.1"
+local MOD_VERSION = "0.2.3-beta.1"
 local TARGET_BUILD = "25982825"
 local MOVE_WALKING = 1
 local MOVE_FLYING = 5
@@ -16,6 +16,19 @@ local DEFAULTS = {
     lowerKey = "PAGE_DOWN",
     dock = "right",
 }
+
+local LIMITS = {
+    flySpeed = { min = 100, max = 50000 },
+    verticalStep = { min = 10, max = 10000 },
+}
+
+local function normalizeNumber(value, fallback, limits)
+    local number = tonumber(value)
+    if number == nil or number ~= number or number == math.huge or number == -math.huge then
+        number = fallback
+    end
+    return math.max(limits.min, math.min(limits.max, math.floor(number)))
+end
 
 local TOGGLE_KEYS = {
     { label = "F5", value = "F5", key = Key.F5 },
@@ -50,8 +63,15 @@ Config.Init({
     defaults = DEFAULTS,
 })
 
-local flySpeed = tonumber(Config.Get("flySpeed")) or DEFAULTS.flySpeed
-local verticalStep = tonumber(Config.Get("verticalStep")) or DEFAULTS.verticalStep
+local function loadNumber(key)
+    local saved = Config.Get(key)
+    local value = normalizeNumber(saved, DEFAULTS[key], LIMITS[key])
+    if saved ~= value then Config.Set(key, value) end
+    return value
+end
+
+local flySpeed = loadNumber("flySpeed")
+local verticalStep = loadNumber("verticalStep")
 local toggleKey = tostring(Config.Get("toggleKey") or DEFAULTS.toggleKey)
 local riseKey = tostring(Config.Get("riseKey") or DEFAULTS.riseKey)
 local lowerKey = tostring(Config.Get("lowerKey") or DEFAULTS.lowerKey)
@@ -62,6 +82,51 @@ local activeMovement = nil
 local savedMovementMode = MOVE_WALKING
 local savedCustomMovementMode = 0
 local savedMaxFlySpeed = nil
+local savedBaseClimbSpeed = nil
+local speedPropertyReady = false
+
+-- Update 6 caches MaxClimbSpeed at BeginPlay and uses that cache to recalculate
+-- MaxFlySpeed, including the game's weight/cold/sprint modifiers. Verify the
+-- actual executable layout before exposing this non-reflected float. Other
+-- builds must be checked again; never apply an unchecked memory offset.
+local SPEED_LAYOUT = {
+    { offset = 0x5574621, hex = "8b860c100000898670110000" },
+    { offset = 0x559eccb, hex = "440f2948b8f3440f108970110000" },
+    { offset = 0x559ee75, hex = "f3440f118b94020000" },
+}
+
+local function prepareSpeedProperty()
+    if speedPropertyReady then return end
+    local source = debug.getinfo(1, "S").source:gsub("^@", ""):gsub("\\", "/")
+    local root = source:match("^(.*)/ue4ss/Mods/TLCPlayerFlight/[Ss]cripts/main%.lua$")
+    local path = (root and (root .. "/") or "") .. "VoyageSteam-Win64-Shipping.exe"
+    local file, problem = io.open(path, "rb")
+    if not file then error("Cannot verify game movement layout: " .. tostring(problem)) end
+    local ok, err = pcall(function()
+        for _, check in ipairs(SPEED_LAYOUT) do
+            local expected = check.hex:gsub("..", function(byte)
+                return string.char(tonumber(byte, 16))
+            end)
+            assert(file:seek("set", check.offset), "Cannot read game movement layout")
+            assert(file:read(#expected) == expected,
+                "Unsupported game movement layout; Player Flight needs an update")
+        end
+    end)
+    file:close()
+    if not ok then error(err) end
+    RegisterCustomProperty({
+        Name = "TLCFlightBaseClimbSpeed",
+        Type = PropertyTypes.FloatProperty,
+        BelongsToClass = "/Script/Voyage.VoyageCharacterMovementComponent",
+        OffsetInternal = 0x1170,
+    })
+    speedPropertyReady = true
+end
+
+local function applyFlightSpeed(movement)
+    movement.TLCFlightBaseClimbSpeed = flySpeed
+    movement.MaxFlySpeed = flySpeed
+end
 
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, message))
@@ -116,6 +181,71 @@ local function getPlayerAndMovement()
     return pawn, movement, nil
 end
 
+local function getActivePlayerAndMovement()
+    local pawn, movement, problem = getPlayerAndMovement()
+    if problem then return nil, nil, problem end
+    if not activePawn or not activePawn:IsValid()
+        or not activeMovement or not activeMovement:IsValid()
+        or pawn:GetAddress() ~= activePawn:GetAddress()
+        or movement:GetAddress() ~= activeMovement:GetAddress() then
+        return nil, nil, "player character changed; toggle flight off and on again"
+    end
+    return pawn, movement, nil
+end
+
+local probeSamplesRemaining = 0
+local probeReason = ""
+
+local function diagnosticValue(read)
+    local ok, value = pcall(read)
+    return ok and tostring(value) or ("ERROR: " .. tostring(value))
+end
+
+local function vectorLength(vector)
+    local x, y, z = tonumber(vector.X), tonumber(vector.Y), tonumber(vector.Z)
+    if not x or not y or not z then error("vector fields are not numeric") end
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+local function logFlightSnapshot(reason)
+    local pawn, movement, problem = getPlayerAndMovement()
+    if problem then
+        log("PROBE " .. reason .. ": " .. problem)
+        return
+    end
+    local values = {
+        "requested=" .. tostring(flySpeed),
+        "mode=" .. diagnosticValue(function() return movement.MovementMode end),
+        "MaxFlySpeed=" .. diagnosticValue(function() return movement.MaxFlySpeed end),
+        "baseSpeed=" .. diagnosticValue(function() return movement.TLCFlightBaseClimbSpeed end),
+        "GetMaxSpeed=" .. diagnosticValue(function() return movement:GetMaxSpeed() end),
+        "MaxAcceleration=" .. diagnosticValue(function() return movement.MaxAcceleration end),
+        "acceleration=" .. diagnosticValue(function() return vectorLength(movement.Acceleration) end),
+        "velocity=" .. diagnosticValue(function() return vectorLength(pawn:GetVelocity()) end),
+        "FluidFriction=" .. diagnosticValue(function()
+            local volume = movement:GetPhysicsVolume()
+            if not volume or not volume:IsValid() then return "no volume" end
+            return volume.FluidFriction
+        end),
+        "component=" .. diagnosticValue(function() return movement:GetFullName() end),
+    }
+    log("PROBE " .. reason .. ": " .. table.concat(values, " | "))
+end
+
+local function armFlightProbe(reason)
+    probeReason = reason
+    probeSamplesRemaining = 3
+    logFlightSnapshot(reason .. " (immediate)")
+end
+
+-- Read-only samples on the game thread. Keep one callback pinned for UE4SS.
+local probeTick = require("ModMenu.core.util").PinFn(function()
+    if not flightEnabled or probeSamplesRemaining <= 0 then return end
+    logFlightSnapshot(probeReason .. " (sample " .. tostring(4 - probeSamplesRemaining) .. ")")
+    probeSamplesRemaining = probeSamplesRemaining - 1
+end)
+LoopInGameThreadWithDelay(1000, probeTick)
+
 local function enableFlight()
     local pawn, movement, problem = getPlayerAndMovement()
     if problem then
@@ -123,21 +253,35 @@ local function enableFlight()
         return false, problem
     end
 
-    activePawn = pawn
-    activeMovement = movement
-
-    pcall(function()
+    local ready, speedProblem = pcall(function()
+        prepareSpeedProperty()
+        local base = movement.TLCFlightBaseClimbSpeed
+        assert(type(base) == "number" and base > 0 and base < 10000000,
+            "Game's cached movement speed is not valid")
         savedMovementMode = movement.MovementMode
         savedCustomMovementMode = movement.CustomMovementMode
         savedMaxFlySpeed = movement.MaxFlySpeed
-        movement.MaxFlySpeed = flySpeed
+        savedBaseClimbSpeed = base
     end)
+    if not ready then
+        log("Cannot enable flight: " .. tostring(speedProblem))
+        return false, tostring(speedProblem)
+    end
+
+    activePawn = pawn
+    activeMovement = movement
 
     local ok, err = pcall(function()
+        applyFlightSpeed(movement)
         movement:SetMovementMode(MOVE_FLYING, 0)
     end)
 
     if not ok then
+        pcall(function()
+            movement.TLCFlightBaseClimbSpeed = savedBaseClimbSpeed
+            movement.MaxFlySpeed = savedMaxFlySpeed
+            movement:SetMovementMode(savedMovementMode, savedCustomMovementMode)
+        end)
         activePawn = nil
         activeMovement = nil
         log("Could not switch movement mode: " .. tostring(err))
@@ -147,19 +291,21 @@ local function enableFlight()
     flightEnabled = true
     updateMenuStatus()
     log(string.format("Flight ON - speed %d, rise %s, lower %s", flySpeed, riseKey, lowerKey))
+    armFlightProbe("flight enabled")
     return true, "Flight ON"
 end
 
 local function disableFlight()
-    local pawn, movement = getPlayerAndMovement()
-    if activePawn and activePawn:IsValid() then
-        pawn = activePawn
-    end
-    if activeMovement and activeMovement:IsValid() then
-        movement = activeMovement
-    end
+    -- Restore only the component whose original values we captured. A new save,
+    -- respawn or possession must not receive another character's saved values.
+    local movement = activeMovement
 
     if movement and movement:IsValid() then
+        if savedBaseClimbSpeed ~= nil then
+            pcall(function()
+                movement.TLCFlightBaseClimbSpeed = savedBaseClimbSpeed
+            end)
+        end
         pcall(function()
             movement:SetMovementMode(savedMovementMode or MOVE_WALKING, savedCustomMovementMode or 0)
         end)
@@ -171,8 +317,10 @@ local function disableFlight()
     end
 
     flightEnabled = false
+    probeSamplesRemaining = 0
     activePawn = nil
     activeMovement = nil
+    savedBaseClimbSpeed = nil
     updateMenuStatus()
     log("Flight OFF")
     return true, "Flight OFF"
@@ -191,7 +339,7 @@ local function moveVertical(amount)
         return false, "Flight is off"
     end
 
-    local pawn, movement, problem = getPlayerAndMovement()
+    local pawn, movement, problem = getActivePlayerAndMovement()
     if problem then
         log("Cannot move vertically: " .. problem)
         return false, problem
@@ -199,7 +347,7 @@ local function moveVertical(amount)
 
     pcall(function()
         movement:SetMovementMode(MOVE_FLYING, 0)
-        movement.MaxFlySpeed = flySpeed
+        applyFlightSpeed(movement)
     end)
 
     local ok, err = pcall(function()
@@ -252,19 +400,26 @@ for _, option in ipairs(RISE_KEYS) do bindOption(option) end
 for _, option in ipairs(LOWER_KEYS) do bindOption(option) end
 
 local function setFlySpeed(value)
-    flySpeed = math.max(100, math.min(5000, math.floor(tonumber(value) or DEFAULTS.flySpeed)))
+    flySpeed = normalizeNumber(value, DEFAULTS.flySpeed, LIMITS.flySpeed)
     Config.Set("flySpeed", flySpeed)
+    -- The numeric widget can clamp a value without changing its visible text.
+    -- Set synchronizes that text without recursively invoking onChange.
+    ModMenu.Set("Flight", "speed", flySpeed)
     if flightEnabled then
         runOnGameThread(function()
-            local _, movement = getPlayerAndMovement()
-            if movement and movement:IsValid() then movement.MaxFlySpeed = flySpeed end
+            if not flightEnabled then return end
+            local _, movement, problem = getActivePlayerAndMovement()
+            if problem then log("Cannot apply speed: " .. problem); return end
+            applyFlightSpeed(movement)
+            armFlightProbe("speed edit")
         end)
     end
 end
 
 local function setVerticalStep(value)
-    verticalStep = math.max(10, math.min(1000, math.floor(tonumber(value) or DEFAULTS.verticalStep)))
+    verticalStep = normalizeNumber(value, DEFAULTS.verticalStep, LIMITS.verticalStep)
     Config.Set("verticalStep", verticalStep)
+    ModMenu.Set("Flight", "verticalStep", verticalStep)
 end
 
 local function restoreDefaults()
@@ -288,8 +443,10 @@ local function restoreDefaults()
 
     if flightEnabled then
         runOnGameThread(function()
-            local _, movement = getPlayerAndMovement()
-            if movement and movement:IsValid() then movement.MaxFlySpeed = flySpeed end
+            if not flightEnabled then return end
+            local _, movement, problem = getActivePlayerAndMovement()
+            if problem then log("Cannot apply speed: " .. problem); return end
+            applyFlightSpeed(movement)
         end)
     end
     log("Settings restored to defaults")
@@ -334,29 +491,33 @@ ModMenu.Register({
         {
             type = "number",
             id = "speed",
-            label = "Flight speed (cm/s)",
+            label = "Flight base speed (cm/s)",
             default = flySpeed,
-            min = 100,
-            max = 5000,
+            min = LIMITS.flySpeed.min,
+            max = LIMITS.flySpeed.max,
             integer = true,
             fieldWidth = 100,
             labelWidth = 190,
-            debounceMs = 250,
+            -- No pending edit to lose when the panel closes or rebuilds.
+            debounceMs = 0,
             onChange = setFlySpeed,
         },
+        { type = "label", label = "Speed range: 100-50000 cm/s." },
+        { type = "label", label = "Game weight, cold and sprint modifiers still apply." },
         {
             type = "number",
             id = "verticalStep",
             label = "Rise/lower step (cm)",
             default = verticalStep,
-            min = 10,
-            max = 1000,
+            min = LIMITS.verticalStep.min,
+            max = LIMITS.verticalStep.max,
             integer = true,
             fieldWidth = 100,
             labelWidth = 190,
-            debounceMs = 250,
+            debounceMs = 0,
             onChange = setVerticalStep,
         },
+        { type = "label", label = "Rise/lower range: 10-10000 cm." },
         { type = "label", label = "Collision stays enabled. Settings save automatically." },
         {
             type = "button",
@@ -410,6 +571,12 @@ ModMenu.Register({
         { type = "label", label = "Changes apply immediately and persist after restart." },
     },
 })
+
+RegisterConsoleCommandHandler("tlcflightstatus", function(_, _, outputDevice)
+    if outputDevice then outputDevice:Log("Flight probe queued; fly forward for 3 seconds, then check UE4SS.log") end
+    runOnGameThread(function() armFlightProbe("console request") end)
+    return true
+end)
 
 RegisterConsoleCommandHandler("tlcfly", function(_, _, outputDevice)
     if outputDevice then outputDevice:Log("TLC flight toggle queued") end
